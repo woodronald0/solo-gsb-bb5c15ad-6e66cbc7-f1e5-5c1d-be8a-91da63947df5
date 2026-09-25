@@ -77,6 +77,16 @@ delta_cap 与已入账申请、预留均不变。来源转出后上限必须仍�
 逐项分摊值与分摊总和（数值误差内恰等于两次占用之差）。归因**严格只读**：
 不写任何记录、不触发预留惰性清扫，每次调用都按实时账本重算。
 
+最后提供**只读的重复工作负载容量试算（repeat-run trial）**：
+`POST /datasets/{dataset_id}/repeat-run-trials` 接收 **1～5 个**分析项（各含
+`epsilon`、`delta`）与 `max_runs`（**1～100000**），把整组分析项视为**一次
+运行（run）**叠加到当前账本（未冲正已授权申请 + 未到期 granted 预留）上，沿用
+既有 RDP 组合口径求「不超 `epsilon_cap` 的最大**完整运行次数**」——即使连一次
+都放不下也正常返回 `0`。响应给出最大次数、该次数下的投影占用，以及**再多运行
+一次**的投影占用（当最大次数已达 `max_runs` 上界时不再多算、该字段为
+`null`）；纯 ε 项在任意次数下仍走精确加法。试算**严格只读**：不创建申请、
+不写任何裁定记录、不触发预留惰性清扫，每次调用都按最新账本重算。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -173,6 +183,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected，并标明是否已冲正） |
 | `POST` | `/datasets/{dataset_id}/selection-plans` | **只读**试算：穷举 1～12 个候选的可行子集，返回总 value 最大的组合（不落库） |
 | `POST` | `/datasets/{dataset_id}/cost-attributions` | **只读**：对 1～10 个已授权未冲正申请按 Shapley 边际增量分摊整组 epsilon 增量（不落库） |
+| `POST` | `/datasets/{dataset_id}/repeat-run-trials` | **只读**：把 1～5 个分析项作为一组工作负载，求 1～100000 内不超 cap 的最大完整运行次数及再跑一次的投影（不落库） |
 | `POST` | `/datasets/{dataset_id}/request-batches` | 原子提交 2～20 项分析批次（整批批准或整批拒绝，按 `batch_id` 幂等） |
 | `GET` | `/datasets/{dataset_id}/request-batches/{batch_id}` | 按 `batch_id` 查询批次裁定与各项当时的组合值 |
 | `POST` | `/datasets/{dataset_id}/requests/{request_id}/reversals` | 冲正一条已授权且未冲正的申请（按 `reversal_id` 幂等） |
@@ -1034,6 +1045,101 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
 * 数据集不存在 → `404 dataset_not_found`；
 * `request_ids` 为空或超过 10 个、存在重复 ID、ID 为空或超长 → `422`。
 
+### 4.18 重复工作负载容量试算（repeat-run trial，只读）
+
+在**不创建任何申请 / 预留 / 裁定记录**的前提下，把一组固定分析项当作一次
+「工作负载运行」，求当前账本下最多能完整重复运行多少次。占用基线与正式准入
+完全一致：全部 **granted 且未冲正**的申请 + 全部**未到期** granted 预留（已
+释放 / 已确认 / 已过期 / 被拒绝的预留不参与）。
+
+```bash
+curl -X POST http://localhost:8000/datasets/sales-2026/repeat-run-trials \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"epsilon": 0.02, "delta": 1e-8},
+      {"epsilon": 0.01, "delta": 0.0}
+    ],
+    "max_runs": 1000
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `items` | array | 必填，**1～5 项**，整组构成一次运行 |
+| `items[].epsilon` | float | `> 0, ≤ 1000`，分析项的 epsilon |
+| `items[].delta` | float | `>= 0, < 1`；`0` 表示纯 ε-DP |
+| `max_runs` | integer | 必填，**1～100000**，考虑的运行次数上界 |
+
+服务把整组各项与当前占用按既有 RDP 口径做**同一条**组合曲线（与批次、试算同
+一张 orders 网格、同一浮点容差）。RDP 曲线逐 order 可加，因此把同一组重复
+`runs` 次等价于把该组的纯 ε 偏移与近似 DP 曲线各乘以 `runs`——**纯 ε 项在任意
+运行次数下都走精确加法**，不收取 RDP 转换余量。可行性（投影 epsilon
+`≤ epsilon_cap + EPSILON_TOLERANCE`）随运行次数单调，因此用二分查找求
+`[0, max_runs]` 内**最大的可行完整运行次数**；即使**零次**可行（连一次都放不
+下）也正常返回。成功返回 `200`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "generated_at": "2026-09-25T12:00:00.000000Z",
+  "item_count": 2,
+  "items": [
+    {"epsilon": 0.02, "delta": 1e-8},
+    {"epsilon": 0.01, "delta": 0.0}
+  ],
+  "max_runs": 1000,
+  "epsilon_cap": 1.0,
+  "epsilon_committed": 0.0,
+  "max_complete_runs": 30,
+  "at_max_runs": false,
+  "projection": {
+    "runs": 30,
+    "epsilon_projected": 0.969153,
+    "epsilon_remaining": 0.030847,
+    "rdp_best_order": 8192.0,
+    "feasible": true
+  },
+  "next_run_projection": {
+    "runs": 31,
+    "epsilon_projected": 1.001402,
+    "epsilon_remaining": 0.0,
+    "rdp_best_order": 8192.0,
+    "feasible": false
+  }
+}
+```
+
+字段说明：
+
+* `epsilon_committed`：试算时刻「未冲正已授权申请 + 未到期有效预留」的组合
+  epsilon（与预算视图口径一致），即零次运行的占用；
+* `max_complete_runs`：`[0, max_runs]` 内投影不超 cap 的**最大完整运行次数**，
+  可能为 `0`（零次可行也会返回，此时 `projection` 即当前账本占用）；
+* `at_max_runs`：最大次数是否已达到 `max_runs` 上界；
+* `projection`：恰好运行 `max_complete_runs` 次后的投影占用（恒可行），含
+  `epsilon_projected`、`epsilon_remaining`、取得该投影的最优 RDP order 与
+  `feasible`；
+* `next_run_projection`：再多运行一次（`max_complete_runs + 1` 次）后的投影；
+  当 `at_max_runs = true`（上界内全部可行）时不再评估上界之外的运行，该字段为
+  `null`；其余情形（含零次可行）都给出——零次可行时它就是运行一次的超额占用
+  且 `feasible = false`。
+
+语义与边界：
+
+* **严格只读、无幂等键**：本接口不写任何表（不产生申请、预留、批次、转拨或
+  冲正记录），也**不触发预留惰性清扫**（与 release-forecast、selection plan、
+  cost attribution 同为纯 SELECT）；**每次调用都按最新账本重算**——账本被其他
+  申请 / 预留 / 冲正 / 转拨改变后，再次试算可能得到不同次数；
+* 分析项仅在试算内参与组合，不锁定任何额度，也不占用任何 `request_id` /
+  `reservation_id` 命名空间；试算结果不构成对未来准入的承诺，正式提交仍按当时
+  账本重新准入；
+* 数据集不存在 → `404 dataset_not_found`；
+* 分析项为 0 个或超过 5 个、`max_runs` 不在 `1..100000`（含小数）、
+  `epsilon` / `delta` 越界等 → `422`。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -1087,6 +1193,14 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
    `V(N) − V(∅)` 分摊到每个所选申请；组合曲线逐 order 可加保证各边际非负，
    Shapley 权重之和为 1，故逐项分摊之和恰等于全组与基线两次占用之差（舍入
    误差内）。
+
+9. 重复工作负载试算（repeat-run trial）也**不改变任何集合、纯 SELECT**：把
+   1～5 个分析项组成的一组在「未冲正已授权申请 ∪ 未到期预留」的当前组合曲线
+   上重复叠加。由于 RDP 曲线逐 order 可加，重复 `runs` 次等于把该组的纯 ε
+   偏移与近似 DP 曲线各乘以 `runs`（纯 ε 项始终走精确加法分支），可行性随
+   `runs` 单调，故以二分查找求 `0..max_runs`（上界 100000）内投影不超 cap 的
+   最大完整运行次数，并返回该次数与再运行一次（`max_complete_runs + 1`）两次
+   投影；当最大次数已达 `max_runs` 时不评估上界之外的运行。零次可行也会返回。
 
 特殊情形：
 
@@ -1147,6 +1261,10 @@ Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（�
   不做惰性清扫**：纯 SELECT 读取未冲正已授权申请与未到期预留后，在进程内
   穷举所选申请的全部子集并按 Shapley 权重分摊增量；与并发写互不阻塞，绝不
   改变数据库状态，每次调用都按实时账本重算。
+* 只读的重复工作负载容量试算（repeat-run trial）同样**不进入写临界区、不开启
+  写事务、不做惰性清扫**：纯 SELECT 读取未冲正申请与未到期预留后，在进程内以
+  曲线倍乘 + 二分查找计算最大可行完整运行次数；与任何并发写互不阻塞，绝不改变
+  数据库状态，每次调用都按实时账本重算。
 
 ---
 
@@ -1252,6 +1370,16 @@ epsilon/delta 越界 422。
 10 项边界，以及缺失数据集 404、缺失申请 404、已拒绝 409 request_not_granted、
 已冲正 409 request_already_reversed、空 / 11 项 / 重复 ID / 空 ID / 超长 ID
 422。
+
+重复工作负载容量试算测试另覆盖：纯 ε 单项 / 多项的精确可加与最大次数、近似
+DP（含纯 / 近似混合组、含已存在占用）结果与直接调用 `rdp.py` 逐次组合的暴力
+核算交叉校验（该次数、再多一次投影均一致）、零次可行（空数据集与已有占用两种）
+照常返回零次投影与一次超额投影、达到 `max_runs` 上界时 `at_max_runs=true` 且
+不再给出再跑一次投影、`max_runs=100000` 边界、当前已授权申请与未到期预留计入
+基线、已过期预留与已冲正申请不参与、严格只读（不产生申请 / 预留 / 冲正记录、
+不触发惰性清扫、重复调用结果稳定）、账本变化后按最新占用重算、恰好到 cap 的
+第 N 次仍可行（含浮点容差）、1～5 项与混合组、5 项边界，以及缺失数据集 404、
+0 / 6 项、`max_runs` 越界（0、100001、小数）与 epsilon/delta 越界 422。
 
 ---
 

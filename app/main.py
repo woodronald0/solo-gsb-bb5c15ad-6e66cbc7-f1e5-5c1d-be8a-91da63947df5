@@ -31,6 +31,8 @@ from .schemas import (
     ReservationRenewalCreate,
     ReservationRenewalView,
     ReservationView,
+    RepeatRunTrialRequest,
+    RepeatRunTrialView,
     SelectionPlanRequest,
     SelectionPlanView,
     Verdict,
@@ -92,7 +94,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -137,7 +139,18 @@ app = FastAPI(
         "selected requests by each one's marginal increment under standard "
         "Shapley weights, returning the baseline and full-group occupancy "
         "alongside the per-request shares and their exact-sum total; it "
-        "creates no records and never sweeps reservations.  Finally, a "
+        "creates no records and never sweeps reservations.  A read-only "
+        "repeat-run trial additionally accepts 1-5 analysis items (each with "
+        "epsilon and delta) together with a max_runs of 1-100000: the whole "
+        "group is treated as one workload run repeated on top of the current "
+        "non-reversed granted requests and non-expired reservations, and the "
+        "endpoint returns the largest complete-run count within max_runs "
+        "whose RDP-projected epsilon stays within the cap (zero is a valid "
+        "answer), the projection at that count and one more run beyond it "
+        "(omitted once max_runs is reached), with pure-epsilon items still "
+        "composed by exact addition; it creates no requests, does not sweep "
+        "reservations and recomputes against the latest ledger on every call.  "
+        "Finally, a "
         "granted analysis request can be reversed with a globally unique "
         "reversal_id and reason: the original verdict and reservation history "
         "stay untouched while an immutable reversal record removes the request "
@@ -423,6 +436,18 @@ async def create_cost_attribution(
     dataset_id: DATASET_ID, payload: CostAttributionRequest
 ) -> dict:
     return await ledger.cost_attribution(dataset_id, payload)
+
+
+@app.post(
+    "/datasets/{dataset_id}/repeat-run-trials",
+    response_model=RepeatRunTrialView,
+    tags=["repeat-run-trials"],
+    summary="Trial how many repeated workload runs fit the cap (read-only)",
+)
+async def create_repeat_run_trial(
+    dataset_id: DATASET_ID, payload: RepeatRunTrialRequest
+) -> dict:
+    return await ledger.repeat_run_trial(dataset_id, payload)
 
 
 @app.get(

@@ -18,6 +18,8 @@ from .schemas import (
     DatasetRegister,
     MAX_EPSILON_CAP,
     MAX_TTL_SECONDS,
+    RepeatRunTrialRequest,
+    RepeatRunWorkloadItem,
     ReversalCreate,
     ReservationConfirm,
     ReservationCreate,
@@ -1745,4 +1747,139 @@ async def cost_attribution(
         "rdp_best_order_full_group": full_order,
         "attributed_total_epsilon": total,
         "attributions": attributions,
+    }
+
+
+# --------------------------------------------------------- repeat-run trials --
+
+
+async def repeat_run_trial(
+    dataset_id: str, payload: RepeatRunTrialRequest
+) -> dict[str, Any]:
+    """Read-only trial: how many complete repetitions of a workload fit.
+
+    The request supplies 1-5 analysis items (each an ``(epsilon, delta)``) and
+    ``max_runs`` between 1 and 100000.  The whole item group is treated as one
+    workload "run" and composed, with the existing RDP accounting, on top of
+    the current ledger occupancy -- granted non-reversed requests plus granted
+    reservations that have not expired *right now*.  RDP curves are additive
+    per order, so ``runs`` repetitions of the identical group amount to the
+    group's pure-DP epsilon offset and its approximate-DP RDP curve both
+    multiplied by ``runs``; pure-epsilon items therefore stay on the exact
+    addition path for every run count.
+
+    Feasibility (projected epsilon <= cap + tolerance) is monotone in the run
+    count, so the largest feasible count in ``[0, max_runs]`` is found by
+    binary search.  The answer is also valid when zero runs fit.
+
+    Like the release forecast, selection plan and cost attribution, this path
+    issues pure SELECTs only: it never sweeps reservation expiry, creates no
+    request, reservation, batch, reversal or any other record, and each call
+    recomputes against the latest committed ledger state.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
+        # read-only; reservations past their TTL simply do not qualify.
+        granted = await db.list_granted_entries(conn, dataset_id)
+        reservation_rows = await db.list_granted_reservation_rows(
+            conn, dataset_id, now_iso=now_iso
+        )
+        assert not conn.in_transaction
+
+    cap = dataset["epsilon_cap"]
+    target_delta = dataset["delta_cap"]
+
+    committed_entries: list[tuple[float, float]] = granted + [
+        (row["epsilon"], row["delta"]) for row in reservation_rows
+    ]
+
+    # Decompose the current ledger occupancy once, exactly like the selection
+    # plan: a flat pure-DP offset plus one composed approximate-DP RDP curve.
+    base_pure = sum(eps for eps, d in committed_entries if d == 0.0)
+    base_approx_curve = rdp.compose_rdp(
+        [
+            rdp.single_rdp_curve(eps, d)
+            for eps, d in committed_entries
+            if d > 0.0
+        ]
+    )
+    base_has_approx = any(d > 0.0 for _, d in committed_entries)
+
+    group_entries = [(item.epsilon, item.delta) for item in payload.items]
+    group_pure = sum(eps for eps, d in group_entries if d == 0.0)
+    group_approx_curve = rdp.compose_rdp(
+        [
+            rdp.single_rdp_curve(eps, d)
+            for eps, d in group_entries
+            if d > 0.0
+        ]
+    )
+    group_has_approx = any(d > 0.0 for _, d in group_entries)
+    n_orders = len(rdp.RDP_ORDERS)
+
+    def _project(runs: int) -> tuple[float, float]:
+        """Composed (epsilon, best_order) after ``runs`` identical group runs."""
+        pure_sum = base_pure + runs * group_pure
+        if not (base_has_approx or (group_has_approx and runs > 0)):
+            if pure_sum == 0.0:
+                # Mirror evaluate_entries([]): no mechanisms at all.
+                return 0.0, rdp.RDP_ORDERS[-1]
+            # Exact pure-DP basic composition.
+            return pure_sum, rdp.RDP_ORDERS[0]
+        composed = list(base_approx_curve)
+        if runs > 0:
+            for j in range(n_orders):
+                composed[j] += runs * group_approx_curve[j]
+        epsilon, order = rdp.rdp_to_approx_dp(composed, target_delta)
+        return max(0.0, pure_sum + epsilon), order
+
+    def _feasible(runs: int) -> bool:
+        epsilon, _ = _project(runs)
+        return epsilon <= cap + settings.epsilon_tolerance
+
+    committed, _ = _project(0)
+
+    # Feasibility is monotone non-increasing in the run count, so binary-search
+    # the largest feasible count in [0, max_runs].
+    lo, hi = 0, payload.max_runs
+    while lo < hi:
+        # Upper midpoint: advance lo while the midpoint is feasible.
+        mid = (lo + hi + 1) // 2
+        if _feasible(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    max_runs_feasible = lo
+
+    def _view(runs: int) -> dict[str, Any]:
+        epsilon, order = _project(runs)
+        return {
+            "runs": runs,
+            "epsilon_projected": epsilon,
+            "epsilon_remaining": max(0.0, cap - epsilon),
+            "rdp_best_order": order,
+            "feasible": epsilon <= cap + settings.epsilon_tolerance,
+        }
+
+    at_max_runs = max_runs_feasible >= payload.max_runs
+    return {
+        "dataset_id": dataset_id,
+        "generated_at": now,
+        "item_count": len(payload.items),
+        "items": [item.model_dump() for item in payload.items],
+        "max_runs": payload.max_runs,
+        "epsilon_cap": cap,
+        "epsilon_committed": committed,
+        "max_complete_runs": max_runs_feasible,
+        "at_max_runs": at_max_runs,
+        "projection": _view(max_runs_feasible),
+        # No run beyond the supplied bound is evaluated once it is reached;
+        # otherwise (also when zero runs fit) report one-more-run occupancy.
+        "next_run_projection": None
+        if at_max_runs
+        else _view(max_runs_feasible + 1),
     }

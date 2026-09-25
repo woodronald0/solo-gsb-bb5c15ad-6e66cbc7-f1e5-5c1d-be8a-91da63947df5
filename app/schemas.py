@@ -790,5 +790,102 @@ class CostAttributionView(BaseModel):
     attributions: list[CostAttributionItem]
 
 
+# -------------------------------------------------------- repeat-run trials --
+
+
+# A read-only repeat-run trial treats a fixed group of 1-5 analysis items as
+# one workload "run" and asks how many complete runs fit; repetitions can be
+# numerous (up to 100_000), so feasibility is binary-searched over run counts
+# instead of re-composing the ledger run by run.
+MIN_REPEAT_RUN_ITEMS = 1
+MAX_REPEAT_RUN_ITEMS = 5
+MIN_REPEAT_RUN_MAX_RUNS = 1
+MAX_REPEAT_RUN_MAX_RUNS = 100_000
+
+
+class RepeatRunWorkloadItem(BaseModel):
+    """One analysis item inside a repeated workload group."""
+
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="Item delta; use 0 for pure epsilon-DP.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+
+class RepeatRunTrialRequest(BaseModel):
+    """A workload group of 1-5 items repeated up to ``max_runs`` times."""
+
+    items: list[RepeatRunWorkloadItem] = Field(
+        ...,
+        min_length=MIN_REPEAT_RUN_ITEMS,
+        max_length=MAX_REPEAT_RUN_ITEMS,
+    )
+    max_runs: int = Field(
+        ...,
+        ge=MIN_REPEAT_RUN_MAX_RUNS,
+        le=MAX_REPEAT_RUN_MAX_RUNS,
+        examples=[1000],
+        description="Upper bound on the number of complete runs to consider "
+        "(1..100000).  The trial returns the largest run count within this "
+        "bound whose projected epsilon stays within the cap.",
+    )
+
+
+class RepeatRunProjection(BaseModel):
+    """Projected occupancy after ``runs`` complete runs on top of the ledger.
+
+    ``feasible`` uses exactly the same comparison as live admission: projected
+    epsilon ``<= epsilon_cap + EPSILON_TOLERANCE``.
+    """
+
+    runs: int
+    epsilon_projected: float
+    epsilon_remaining: float
+    rdp_best_order: float
+    feasible: bool
+
+
+class RepeatRunTrialView(BaseModel):
+    """Result of a read-only repeated-workload capacity trial.
+
+    Nothing is persisted: no analysis request, reservation or verdict record
+    is ever created and reservation expiry is never swept; every call
+    recomputes against the current ledger (granted non-reversed requests plus
+    non-expired granted reservations).  The whole item group is composed once
+    per run with the existing RDP rules (pure epsilon stays exactly additive)
+    and repeated; ``max_complete_runs`` is the largest count within
+    ``max_runs`` whose projection fits -- it may be 0, in which case even one
+    run does not fit and ``next_run_projection`` reports the over-cap
+    occupancy of a single run.  When ``max_complete_runs == max_runs`` the
+    supplied bound is reached and ``next_run_projection`` is null (no run
+    beyond the bound is evaluated).
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    item_count: int
+    # Submitted items echoed back in their request order.
+    items: list[RepeatRunWorkloadItem]
+    max_runs: int
+    epsilon_cap: float
+    # Composed epsilon of the current ledger before any simulated run.
+    epsilon_committed: float
+    # Largest run count in [0, max_runs] whose projection fits the cap.
+    max_complete_runs: int
+    # True iff max_complete_runs == max_runs (the supplied bound was reached).
+    at_max_runs: bool
+    # Projection at exactly max_complete_runs runs (always feasible).
+    projection: RepeatRunProjection
+    # Projection at max_complete_runs + 1 runs; null once max_runs is reached.
+    next_run_projection: Optional[RepeatRunProjection] = None
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
