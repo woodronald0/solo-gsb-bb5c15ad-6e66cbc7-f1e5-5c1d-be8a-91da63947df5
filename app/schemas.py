@@ -790,5 +790,103 @@ class CostAttributionView(BaseModel):
     attributions: list[CostAttributionItem]
 
 
+# --------------------------------------------------------- workload trials --
+
+
+# A read-only repeated-workload trial composes one fixed group per run; the
+# group carries 1-5 analysis items and may be repeated at most 100000 times.
+MIN_WORKLOAD_ITEMS = 1
+MAX_WORKLOAD_ITEMS = 5
+MIN_WORKLOAD_RUNS = 1
+MAX_WORKLOAD_RUNS = 100_000
+
+
+class WorkloadItem(BaseModel):
+    """One analysis item of the repeated workload group.
+
+    Items carry no id: the whole group is treated as one indivisible run and
+    repeated verbatim, so only the privacy parameters matter.
+    """
+
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="Per-item delta; use 0 for pure epsilon-DP.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+
+class WorkloadCapacityTrialRequest(BaseModel):
+    """A fixed 1-5 item workload group repeated up to ``max_runs`` times."""
+
+    items: list[WorkloadItem] = Field(
+        ...,
+        min_length=MIN_WORKLOAD_ITEMS,
+        max_length=MAX_WORKLOAD_ITEMS,
+        examples=[
+            [
+                {"epsilon": 0.1, "delta": 1e-8},
+                {"epsilon": 0.05, "delta": 0.0},
+            ]
+        ],
+    )
+    max_runs: int = Field(
+        ...,
+        ge=MIN_WORKLOAD_RUNS,
+        le=MAX_WORKLOAD_RUNS,
+        examples=[1000],
+        description="Upper bound on the number of complete runs to trial; "
+        "the reported maximum never exceeds it.",
+    )
+
+
+class WorkloadProjection(BaseModel):
+    """Projected occupancy after an exact number of complete workload runs."""
+
+    complete_runs: int
+    # Composed epsilon of the current ledger occupancy plus every item of
+    # every run, evaluated under the existing RDP accounting.
+    projected_epsilon: float
+    # epsilon_cap - projected_epsilon, floored at zero like the budget views.
+    epsilon_remaining: float
+    rdp_best_order: float
+    # Whether the projection stays within epsilon_cap (+ tolerance).
+    fits_cap: bool
+
+
+class WorkloadCapacityTrialView(BaseModel):
+    """Read-only capacity trial for repeating one workload group.
+
+    Nothing is persisted: no analysis request, reservation or verdict record
+    is ever created, the lazy reservation sweep never runs, and every call
+    recomputes against the current ledger (granted non-reversed requests plus
+    non-expired granted reservations).  ``max_complete_runs`` is the largest
+    repetition count (0..max_runs) whose whole-group RDP composition fits the
+    dataset's epsilon_cap; pure-epsilon items keep composing by exact
+    addition.  ``projection_at_max`` describes that count and
+    ``projection_one_more_run`` the count plus one additional run; the latter
+    is omitted once the maximum has reached ``max_runs``.
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    item_count: int
+    max_runs: int
+    epsilon_cap: float
+    # Composed epsilon currently occupied before any run is added.
+    epsilon_committed: float
+    # Largest k in 0..max_runs whose projection stays within epsilon_cap.
+    max_complete_runs: int
+    projection_at_max: WorkloadProjection
+    # Projection for max_complete_runs + 1; null when max_complete_runs is
+    # already max_runs (no further run needs to be evaluated).
+    projection_one_more_run: Optional[WorkloadProjection]
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)

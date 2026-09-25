@@ -23,6 +23,7 @@ from .schemas import (
     ReservationCreate,
     ReservationRenewalCreate,
     SelectionPlanCandidate,
+    WorkloadCapacityTrialRequest,
     utcnow,
 )
 
@@ -1745,4 +1746,184 @@ async def cost_attribution(
         "rdp_best_order_full_group": full_order,
         "attributed_total_epsilon": total,
         "attributions": attributions,
+    }
+
+
+# ---------------------------------------------------- workload capacity trial --
+
+
+async def workload_capacity_trial(
+    dataset_id: str, payload: WorkloadCapacityTrialRequest
+) -> dict[str, Any]:
+    """Read-only trial: largest feasible number of whole-workload repetitions.
+
+    The fixed 1-5 item workload group is treated as one indivisible run.  The
+    current ledger occupancy is computed with the exact same RDP accounting as
+    admission checks -- granted, non-reversed requests plus granted
+    reservations that have not expired *right now* -- but, like the release
+    forecast, selection plan and cost attribution, this path issues pure
+    SELECTs only: it never runs the lazy expiry sweep and creates no request,
+    reservation, batch, reversal or any other record.  Every call therefore
+    recomputes against the latest committed ledger state.
+
+    After ``k`` runs the RDP curve is the committed curve plus ``k`` copies of
+    the group curve (RDP composition is additive), plus the pure-epsilon
+    offsets multiplied by ``k``.  Pure-epsilon items therefore keep composing
+    by exact addition (including the all-pure special case, which never pays
+    the RDP conversion overhead).  Feasibility of a count means the converted
+    projected epsilon stays within ``epsilon_cap + tolerance``.
+
+    The maximal feasible ``k`` in ``0..max_runs`` is obtained in closed form:
+    per RDP order the composed value is affine in ``k`` and feasibility at
+    that order is a floor bound; because the conversion takes the minimum over
+    orders feasibility is existential, so the bounds are combined by taking the
+    maximum.  The candidate is then reconciled against exact projections to
+    absorb floating-point round-off.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
+        # read-only; reservations past their TTL simply do not qualify.
+        granted = await db.list_granted_entries(conn, dataset_id)
+        reservation_rows = await db.list_granted_reservation_rows(
+            conn, dataset_id, now_iso=now_iso
+        )
+        assert not conn.in_transaction
+
+    cap = dataset["epsilon_cap"]
+    target_delta = dataset["delta_cap"]
+    max_runs = payload.max_runs
+
+    committed_entries: list[tuple[float, float]] = granted + [
+        (row["epsilon"], row["delta"]) for row in reservation_rows
+    ]
+    run_entries: list[tuple[float, float]] = [
+        (item.epsilon, item.delta) for item in payload.items
+    ]
+
+    # Decompose the committed occupancy and one run into the flat pure-DP
+    # offset plus one RDP curve each, so every repetition is a scalar
+    # per-order multiple instead of recomposing the whole ledger per run.
+    base_pure = sum(eps for eps, d in committed_entries if d == 0.0)
+    base_approx_curve = rdp.compose_rdp(
+        [
+            rdp.single_rdp_curve(eps, d)
+            for eps, d in committed_entries
+            if d > 0.0
+        ]
+    )
+    base_has_approx = any(d > 0.0 for _, d in committed_entries)
+
+    run_pure = sum(eps for eps, d in run_entries if d == 0.0)
+    run_approx_curve = rdp.compose_rdp(
+        [rdp.single_rdp_curve(eps, d) for eps, d in run_entries if d > 0.0]
+    )
+    run_has_approx = any(d > 0.0 for _, d in run_entries)
+
+    n_orders = len(rdp.RDP_ORDERS)
+
+    def _project(repeats: int) -> tuple[float, float]:
+        """Composed (epsilon, best_order) after ``repeats`` whole runs."""
+        pure_sum = base_pure + repeats * run_pure
+        if not base_has_approx and not run_has_approx:
+            if pure_sum == 0.0:
+                # Mirror evaluate_entries([]): no mechanisms at all.
+                return 0.0, rdp.RDP_ORDERS[-1]
+            # Exact pure-DP basic composition.
+            return pure_sum, rdp.RDP_ORDERS[0]
+        if repeats == 0 and not base_has_approx:
+            # No approximate mechanisms are present yet (the run's approximate
+            # curves are all multiplied by zero): the composed curve is flat
+            # zero and the pure offset is exact, mirroring evaluate_entries.
+            return pure_sum, rdp.RDP_ORDERS[0]
+        composed = [
+            base_approx_curve[i] + repeats * run_approx_curve[i]
+            for i in range(n_orders)
+        ]
+        epsilon, order = rdp.rdp_to_approx_dp(composed, target_delta)
+        return max(0.0, pure_sum + epsilon), order
+
+    committed, _ = _project(0)
+    committed = max(0.0, committed)
+
+    if not run_has_approx:
+        # A pure-only run adds an exact, constant epsilon slope on top of the
+        # committed composition (whose own conversion is independent of k):
+        # the maximal count follows directly.
+        if run_pure <= 0.0:
+            candidate = max_runs
+        else:
+            candidate = int(
+                math.floor(
+                    (cap + settings.epsilon_tolerance - committed) / run_pure
+                )
+            )
+    else:
+        # Per RDP order the composed value is A_alpha + n * B_alpha and the
+        # converted epsilon stays feasible at order alpha whenever
+        #   A_alpha + n * B_alpha <= cap + tol - overhead_alpha - base_pure,
+        # i.e. n <= floor((L_alpha - A_alpha) / B_alpha).  Feasibility is an
+        # existential over orders (the conversion takes the minimum), so the
+        # maximal feasible count is the largest per-order floor.
+        limit = cap + settings.epsilon_tolerance
+        log_inv_target_delta = math.log((1.0 - target_delta) / target_delta)
+        candidate = 0
+        for i, alpha in enumerate(rdp.RDP_ORDERS):
+            overhead = (
+                math.log((alpha - 1.0) / alpha) + log_inv_target_delta
+            ) / (alpha - 1.0)
+            l_alpha = limit - overhead - base_pure
+            a_alpha = base_approx_curve[i]
+            b_alpha = run_approx_curve[i] + run_pure
+            if (
+                b_alpha > 0.0
+                and l_alpha >= a_alpha - settings.epsilon_tolerance
+            ):
+                n_alpha = math.floor((l_alpha - a_alpha) / b_alpha)
+                if n_alpha > candidate:
+                    candidate = n_alpha
+
+    candidate = max(0, min(candidate, max_runs))
+
+    # Reconcile the closed-form candidate against exact projections so the
+    # answer is exactly the largest feasible count (possibly zero), immune to
+    # accumulated floating-point round-off in the per-order floors.
+    feasible_limit = cap + settings.epsilon_tolerance
+    while (
+        candidate < max_runs and _project(candidate + 1)[0] <= feasible_limit
+    ):
+        candidate += 1
+    while candidate > 0 and _project(candidate)[0] > feasible_limit:
+        candidate -= 1
+    max_complete_runs = candidate
+
+    def _projection_view(repeats: int) -> dict[str, Any]:
+        projected, order = _project(repeats)
+        projected = max(0.0, projected)
+        return {
+            "complete_runs": repeats,
+            "projected_epsilon": projected,
+            "epsilon_remaining": max(0.0, cap - projected),
+            "rdp_best_order": order,
+            "fits_cap": projected <= feasible_limit,
+        }
+
+    return {
+        "dataset_id": dataset_id,
+        "generated_at": now,
+        "item_count": len(payload.items),
+        "max_runs": max_runs,
+        "epsilon_cap": cap,
+        "epsilon_committed": committed,
+        "max_complete_runs": max_complete_runs,
+        "projection_at_max": _projection_view(max_complete_runs),
+        # Once the maximum is already max_runs no extra run is evaluated.
+        "projection_one_more_run": (
+            None
+            if max_complete_runs >= max_runs
+            else _projection_view(max_complete_runs + 1)
+        ),
     }

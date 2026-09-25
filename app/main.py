@@ -35,6 +35,8 @@ from .schemas import (
     SelectionPlanView,
     Verdict,
     BudgetView,
+    WorkloadCapacityTrialRequest,
+    WorkloadCapacityTrialView,
 )
 
 DATASET_ID = Annotated[
@@ -92,7 +94,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -137,7 +139,16 @@ app = FastAPI(
         "selected requests by each one's marginal increment under standard "
         "Shapley weights, returning the baseline and full-group occupancy "
         "alongside the per-request shares and their exact-sum total; it "
-        "creates no records and never sweeps reservations.  Finally, a "
+        "creates no records and never sweeps reservations.  A read-only "
+        "repeated-workload capacity trial also accepts 1-5 analysis items "
+        "(each with epsilon and delta) together with max_runs in 1-100000: "
+        "it treats the whole group as one run and, against the current "
+        "non-reversed granted requests and non-expired reservations, reports "
+        "the largest number of complete runs (0..max_runs) whose repeated RDP "
+        "composition stays within epsilon_cap (pure-epsilon items still "
+        "compose by exact addition), with the projection at that count and "
+        "after one more run; it creates no requests, sweeps no reservations "
+        "and recomputes against the latest ledger on every call.  Finally, a "
         "granted analysis request can be reversed with a globally unique "
         "reversal_id and reason: the original verdict and reservation history "
         "stay untouched while an immutable reversal record removes the request "
@@ -423,6 +434,18 @@ async def create_cost_attribution(
     dataset_id: DATASET_ID, payload: CostAttributionRequest
 ) -> dict:
     return await ledger.cost_attribution(dataset_id, payload)
+
+
+@app.post(
+    "/datasets/{dataset_id}/workload-capacity-trials",
+    response_model=WorkloadCapacityTrialView,
+    tags=["workload-capacity-trials"],
+    summary="Trial the max feasible repetitions of one workload group (read-only)",
+)
+async def create_workload_capacity_trial(
+    dataset_id: DATASET_ID, payload: WorkloadCapacityTrialRequest
+) -> dict:
+    return await ledger.workload_capacity_trial(dataset_id, payload)
 
 
 @app.get(
